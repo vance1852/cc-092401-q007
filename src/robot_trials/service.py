@@ -57,10 +57,30 @@ class TrialService:
     def _audit(
         self, entity_type: str, entity_id: str, event_type: str, actor_id: str, payload: Mapping[str, Any]
     ) -> None:
+        full_payload = dict(payload)
+        # 观测与排除事件本身不携带批次标识，写入审计表时补上 batch_id，
+        # 让批次报告可以仅凭事件链还原归属；旧事件没有该字段时由报告查询
+        # 通过 observations / exclusion_requests 关系回退归属。
+        if entity_type == "observation":
+            row = self.connection.execute(
+                "SELECT batch_id FROM observations WHERE observation_id=?", (entity_id,)
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(f"审计事件引用了不存在的观测: {entity_id}")
+            full_payload.setdefault("batch_id", row["batch_id"])
+        elif entity_type == "exclusion":
+            row = self.connection.execute(
+                "SELECT o.batch_id FROM exclusion_requests e "
+                "JOIN observations o ON o.observation_id=e.observation_id WHERE e.exclusion_id=?",
+                (entity_id,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(f"审计事件引用了不存在的排除记录: {entity_id}")
+            full_payload.setdefault("batch_id", row["batch_id"])
         self.connection.execute(
             "INSERT INTO audit_events(entity_type,entity_id,event_type,actor_id,payload_json,created_at) "
             "VALUES(?,?,?,?,?,?)",
-            (entity_type, entity_id, event_type, actor_id, canonical_json(payload), self._now()),
+            (entity_type, entity_id, event_type, actor_id, canonical_json(full_payload), self._now()),
         )
 
     def create_user(self, user_id: str, display_name: str, role: str) -> dict[str, Any]:
@@ -533,10 +553,35 @@ class TrialService:
             "FROM exclusion_requests e JOIN observations o ON o.observation_id=e.observation_id "
             "WHERE o.batch_id=? ORDER BY e.exclusion_id", (batch_id,)
         ).fetchall()
+        # 事件链覆盖与该批次直接或间接关联的全部审计事件：
+        # - batch 事件：entity_id 即批次编号；
+        # - observation 事件：新事件 payload.batch_id 显式归属，
+        #   旧事件通过 observations.batch_id 回退归属；
+        # - exclusion 事件：新事件 payload.batch_id 显式归属，
+        #   旧事件通过 exclusion_requests -> observations 回退归属。
+        # 任一归属路径都严格限定为当前批次，绝不会混入其他批次的记录。
         events = self.connection.execute(
-            "SELECT event_type,actor_id,payload_json,created_at FROM audit_events "
-            "WHERE entity_type='batch' AND entity_id=? "
-            "ORDER BY event_id", (batch_id,)
+            """
+            SELECT a.event_id,a.entity_type,a.entity_id,a.event_type,a.actor_id,a.payload_json,a.created_at
+            FROM audit_events a
+            LEFT JOIN observations ao
+                ON a.entity_type='observation' AND ao.observation_id=CAST(a.entity_id AS INTEGER)
+            LEFT JOIN exclusion_requests ae
+                ON a.entity_type='exclusion' AND ae.exclusion_id=CAST(a.entity_id AS INTEGER)
+            LEFT JOIN observations aeo ON aeo.observation_id=ae.observation_id
+            WHERE
+                (a.entity_type='batch' AND a.entity_id=?)
+                OR (
+                    a.entity_type='observation'
+                    AND COALESCE(json_extract(a.payload_json, '$.batch_id'), ao.batch_id)=?
+                )
+                OR (
+                    a.entity_type='exclusion'
+                    AND COALESCE(json_extract(a.payload_json, '$.batch_id'), aeo.batch_id)=?
+                )
+            ORDER BY a.event_id
+            """,
+            (batch_id, batch_id, batch_id),
         ).fetchall()
         return {
             "batch": batch,
@@ -556,5 +601,13 @@ class TrialService:
             },
             "decision": None if decision_row is None else dict(decision_row),
             "exclusions": [dict(row) for row in exclusions],
-            "events": [dict(row) | {"payload": json.loads(row["payload_json"])} for row in events],
+            "events": [
+                dict(row) | {
+                    "event_id": row["event_id"],
+                    "entity_type": row["entity_type"],
+                    "entity_id": row["entity_id"],
+                    "payload": json.loads(row["payload_json"]),
+                }
+                for row in events
+            ],
         }
