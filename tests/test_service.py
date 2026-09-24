@@ -96,6 +96,114 @@ class ServiceTests(unittest.TestCase):
         ).fetchall()
         self.assertEqual([row[0] for row in events], ["exclusion.requested", "exclusion.revoked"])
 
+    def _create_second_batch(self, batch_id: str = "batch-b") -> None:
+        self.service.register_build("operator", "build-b", "robot-a", "2.0", "c" * 64)
+        self.service.create_batch("operator", batch_id, "demo-delivery-v1", 1, "build-b")
+        self.service.start_batch("operator", batch_id, 1)
+        self.service.import_observations("operator", batch_id, "key-b", self.rows)
+
+    def _expected_event_ids(self, batch_id: str) -> list[int]:
+        """按修复后的归属关系，从底层审计表推导该批次应有的事件链。"""
+        rows = self.connection.execute(
+            """
+            SELECT a.event_id FROM audit_events a
+            WHERE (a.entity_type='batch' AND a.entity_id=?)
+               OR (a.entity_type='observation' AND a.entity_id IN (
+                    SELECT CAST(observation_id AS TEXT) FROM observations WHERE batch_id=?))
+               OR (a.entity_type='exclusion' AND a.entity_id IN (
+                    SELECT CAST(e.exclusion_id AS TEXT) FROM exclusion_requests e
+                    JOIN observations o ON o.observation_id=e.observation_id WHERE o.batch_id=?))
+            ORDER BY a.event_id
+            """,
+            (batch_id, batch_id, batch_id),
+        ).fetchall()
+        return [row[0] for row in rows]
+
+    def test_report_restores_full_exclusion_chain_with_entity_identity(self) -> None:
+        self.service.import_observations("operator", "batch-a", "key-1", self.rows)
+        observation_id = self.connection.execute(
+            "SELECT observation_id FROM observations WHERE batch_id='batch-a' ORDER BY observation_id LIMIT 1"
+        ).fetchone()[0]
+        exclusion_id = self.service.request_exclusion("operator", observation_id, "现场记录失效")["exclusion_id"]
+        self.service.review_exclusion("stat", exclusion_id, True, "证据充分")
+        self.service.revoke_exclusion("operator", exclusion_id, "已找回原始记录")
+
+        report = self.service.report("auditor", "batch-a")
+        exclusion_events = [
+            event for event in report["events"] if event["event_type"].startswith("exclusion.")
+        ]
+        self.assertEqual(
+            [(event["event_type"], event["entity_type"], event["entity_id"]) for event in exclusion_events],
+            [
+                ("exclusion.requested", "observation", str(observation_id)),
+                ("exclusion.approved", "exclusion", str(exclusion_id)),
+                ("exclusion.revoked", "observation", str(observation_id)),
+            ],
+        )
+        # 报告事件与底层审计表按关系归属出的事件完全一致，且按全局 event_id 升序。
+        event_ids = [event["event_id"] for event in report["events"]]
+        self.assertEqual(event_ids, self._expected_event_ids("batch-a"))
+        self.assertEqual(event_ids, sorted(event_ids))
+        self.assertTrue(all({"entity_type", "entity_id"} <= event.keys() for event in report["events"]))
+
+    def test_report_includes_rejected_exclusion(self) -> None:
+        self.service.import_observations("operator", "batch-a", "key-1", self.rows)
+        observation_id = self.connection.execute(
+            "SELECT observation_id FROM observations WHERE batch_id='batch-a' ORDER BY observation_id LIMIT 1"
+        ).fetchone()[0]
+        exclusion_id = self.service.request_exclusion("operator", observation_id, "疑似异常")["exclusion_id"]
+        self.service.review_exclusion("stat", exclusion_id, False, "证据不足")
+
+        report = self.service.report("auditor", "batch-a")
+        self.assertEqual(
+            [(event["event_type"], event["entity_type"]) for event in report["events"]
+             if event["event_type"].startswith("exclusion.")],
+            [("exclusion.requested", "observation"), ("exclusion.rejected", "exclusion")],
+        )
+        self.assertEqual(
+            [event["event_id"] for event in report["events"]], self._expected_event_ids("batch-a")
+        )
+
+    def test_multi_batch_reports_do_not_mix_event_chains(self) -> None:
+        self.service.import_observations("operator", "batch-a", "key-1", self.rows)
+        self._create_second_batch()
+
+        # 在两个批次交错制造排除事件，全局 event_id 交织，但归属必须彼此隔离。
+        obs_a = self.connection.execute(
+            "SELECT observation_id FROM observations WHERE batch_id='batch-a' ORDER BY observation_id LIMIT 1"
+        ).fetchone()[0]
+        obs_b = self.connection.execute(
+            "SELECT observation_id FROM observations WHERE batch_id='batch-b' ORDER BY observation_id LIMIT 1"
+        ).fetchone()[0]
+        exc_a = self.service.request_exclusion("operator", obs_a, "A 批失效")["exclusion_id"]
+        exc_b = self.service.request_exclusion("operator", obs_b, "B 批失效")["exclusion_id"]
+        self.service.review_exclusion("stat", exc_a, True, "A 批准")
+        self.service.review_exclusion("stat", exc_b, False, "B 驳回")
+        self.service.revoke_exclusion("operator", exc_a, "A 撤销")
+
+        report_a = self.service.report("auditor", "batch-a")
+        report_b = self.service.report("auditor", "batch-b")
+        ids_a = [event["event_id"] for event in report_a["events"]]
+        ids_b = [event["event_id"] for event in report_b["events"]]
+
+        # 数量、先后关系、归属与底层审计表完全一致；两批次事件链互不重叠。
+        self.assertEqual(ids_a, self._expected_event_ids("batch-a"))
+        self.assertEqual(ids_b, self._expected_event_ids("batch-b"))
+        self.assertEqual(set(ids_a).intersection(ids_b), set())
+        self.assertNotIn(str(exc_b), [event["entity_id"] for event in report_a["events"]])
+        self.assertNotIn(str(obs_b), [event["entity_id"] for event in report_a["events"]])
+        self.assertNotIn(str(exc_a), [event["entity_id"] for event in report_b["events"]])
+        # B 批次只看到自己的驳回，看不到 A 批次的批准与撤销。
+        b_exclusion_types = [
+            event["event_type"] for event in report_b["events"]
+            if event["event_type"].startswith("exclusion.")
+        ]
+        self.assertEqual(b_exclusion_types, ["exclusion.requested", "exclusion.rejected"])
+        # 每个事件都携带实体类型与实体标识。
+        for report in (report_a, report_b):
+            self.assertTrue(all(event["entity_type"] for event in report["events"]))
+            self.assertTrue(all(event["entity_id"] != "" for event in report["events"]))
+
     def test_failed_job_returns_to_queue_after_delay(self) -> None:
         self.service.import_observations("operator", "batch-a", "key-1", self.rows)
         self.service.seal_batch("stat", "batch-a", 2)

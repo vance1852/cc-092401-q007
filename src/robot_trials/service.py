@@ -533,10 +533,27 @@ class TrialService:
             "FROM exclusion_requests e JOIN observations o ON o.observation_id=e.observation_id "
             "WHERE o.batch_id=? ORDER BY e.exclusion_id", (batch_id,)
         ).fetchall()
+        # 批次事件直接挂在批次实体上；观测与排除事件本身不带 batch_id，
+        # 需经 observations / exclusion_requests 的现有关系间接归属到批次，
+        # 三个分支按 entity_type 严格互斥，不会混入其他批次的同类记录。
         events = self.connection.execute(
-            "SELECT event_type,actor_id,payload_json,created_at FROM audit_events "
-            "WHERE entity_type='batch' AND entity_id=? "
-            "ORDER BY event_id", (batch_id,)
+            """
+            SELECT a.event_id,a.entity_type,a.entity_id,a.event_type,a.actor_id,a.payload_json,a.created_at
+            FROM audit_events a
+            LEFT JOIN observations batch_observations
+                ON a.entity_type='observation'
+               AND a.entity_id=CAST(batch_observations.observation_id AS TEXT)
+            LEFT JOIN exclusion_requests batch_exclusions
+                ON a.entity_type='exclusion'
+               AND a.entity_id=CAST(batch_exclusions.exclusion_id AS TEXT)
+            LEFT JOIN observations exclusion_observations
+                ON exclusion_observations.observation_id=batch_exclusions.observation_id
+            WHERE (a.entity_type='batch' AND a.entity_id=?)
+               OR (a.entity_type='observation' AND batch_observations.batch_id=?)
+               OR (a.entity_type='exclusion' AND exclusion_observations.batch_id=?)
+            ORDER BY a.event_id
+            """,
+            (batch_id, batch_id, batch_id),
         ).fetchall()
         return {
             "batch": batch,
@@ -556,5 +573,16 @@ class TrialService:
             },
             "decision": None if decision_row is None else dict(decision_row),
             "exclusions": [dict(row) for row in exclusions],
-            "events": [dict(row) | {"payload": json.loads(row["payload_json"])} for row in events],
+            "events": [
+                {
+                    "event_id": row["event_id"],
+                    "entity_type": row["entity_type"],
+                    "entity_id": row["entity_id"],
+                    "event_type": row["event_type"],
+                    "actor_id": row["actor_id"],
+                    "payload": json.loads(row["payload_json"]),
+                    "created_at": row["created_at"],
+                }
+                for row in events
+            ],
         }
